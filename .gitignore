@@ -1,0 +1,6 @@
+honeypot.log
+ids_alerts.txt
+incident_report.txt
+attack_graph.png
+file_trap/
+__pycache__/
