@@ -1,53 +1,93 @@
 # Honeypot Attack Detection System
 
 ## Overview
-This project implements a **low-interaction honeypot** using Python to simulate a fake SSH-like service.  
-It is designed for **Blue Team / Defensive Security learning**, focusing on detecting brute-force attacks and analyzing attacker behavior.
+A **low-interaction honeypot** built in Python that simulates fake SSH, Telnet, and FTP services to detect and analyze brute-force attacks and attacker behavior.
 
-The script has been modernized to include a **standalone dashboard**, meaning the web UI and honeypot server run concurrently entirely entirely from a single Python file.
-
-The honeypot records:
-- Attacker IP addresses
-- Username & password attempts
-- Number of attempts per IP
-- Attack severity levels
-- Incident reports
-- Traffic visualization graphs
+Designed for **Blue Team / Defensive Security** learning and portfolio demonstrations.
 
 ---
 
-## Features Added
-- **Beautiful Web Dashboard:** A responsive dashboard combining live log monitoring, stat tracking, and real-time attack distribution visualizations.
-- **Unified Architecture:** All backend (Flask app) and frontend (glassmorphism UI with HTML/CSS/JS) logic is packaged dynamically within `Honeypot.py` for maximum portability and minimalism. It requires no separate directory structures.
+## Features
+- **Multi-Protocol Honeypots** — Listens on SSH (port 2222), Telnet (port 23), and FTP (port 21) simultaneously.
+- **Advanced Interactive Shell** — A stateful fake Linux shell that attackers can explore (`cd`, `ls`, `cat`, `wget`, etc.)
+- **Payload Capture** — Detects and logs `wget`/`curl` commands to capture attacker-supplied malware URLs.
+- **Real-Time Web Dashboard** — A dark-themed SOC dashboard showing live logs, incident reports, severity stats, and the attack graph.
+- **Severity Classification** — Automatically classifies each attacker as LOW, MEDIUM, or HIGH severity.
+- **Geo-IP Tagging** — Tags each attacker IP as Local, Private, or Unknown.
+- **IDS Alerts** — HIGH severity attacks and payload captures are escalated and written to `ids_alerts.txt`.
+- **Incident Reports** — Auto-generated per-IP incident reports.
+- **Attack Graphs** — Matplotlib bar chart of attack attempts per IP, refreshed in the dashboard.
+- **File Trap** — Detects file tampering in the `file_trap/` directory (simulates ransomware detection).
 
 ---
 
-## Objectives
-- Detect brute-force login attempts
-- Log attacker activity for forensic analysis
-- Assign severity based on attack intensity
-- Generate incident reports automatically
-- Visualize attack patterns in a dynamic, locally hosted dashboard view
+## Architecture
+Everything runs from a **single file** (`Honeypot.py`). No separate directories or files are required.
+
+When launched, the following four services start concurrently:
+
+| Service | Port | Description |
+|---|---|---|
+| SSH Honeypot | 2222 | Fake SSH with interactive shell |
+| Telnet Honeypot | 23 | Fake Telnet with interactive shell |
+| FTP Honeypot | 21 | Fake FTP capturing credentials |
+| Web Dashboard | 5000 | Live SOC dashboard (Flask) |
 
 ---
 
-## Technologies Used
-- Python (Socket Programming, Multithreading)
-- Flask (For the Dashboard UI backend)
-- Vanilla HTML/CSS/JS (Stored as literal strings for portability)
-- Matplotlib (Graphs)
-- File-based logging
+## Technologies
+- Python (Socket, Threading, Socket Programming)
+- Flask (Dashboard backend)
+- Matplotlib (Attack graphs)
+- Vanilla HTML/CSS/JS (Dashboard frontend, embedded in script)
 
 ---
 
 ## How to Run
 
-1. Install dependencies:
-`pip install flask matplotlib`
+### 1. Install dependencies
+```bash
+pip install flask matplotlib
+```
 
-2. Run the honeypot unified script:
-`python Honeypot.py`
+### 2. Run the script
+```bash
+python Honeypot.py
+```
 
-3. The script will automatically start TWO concurrent services:
-- The Fake SSH honeypot listening on port `2222`.
-- The interactive cyber-dashboard viewable at: `http://localhost:5000`
+> **Note:** Ports 21 (FTP) and 23 (Telnet) require **Administrator** privileges on Windows.  
+> Run your terminal as Administrator to enable all three honeypot services.
+
+### 3. Access the Dashboard
+Open `http://localhost:5000` in your browser.
+
+---
+
+## Generated Files
+
+| File | Description |
+|---|---|
+| `honeypot.log` | All raw attack activity logs |
+| `incident_report.txt` | Structured per-IP incident report |
+| `ids_alerts.txt` | Escalated HIGH severity and payload capture alerts |
+| `attack_graph.png` | Bar chart of attempts per IP |
+| `file_trap/` | Monitored directory for ransomware detection |
+
+---
+
+## Testing
+
+Connect to each service and simulate attacks:
+
+```bash
+# SSH (any TCP client)
+ncat 127.0.0.1 2222
+
+# Telnet
+telnet 127.0.0.1 23
+
+# FTP
+ftp 127.0.0.1 21
+```
+
+Shell commands supported: `ls`, `cd`, `pwd`, `cat`, `whoami`, `id`, `uname`, `wget`, `curl`, `ifconfig`, `history`, `exit`

@@ -5,9 +5,6 @@ import os
 import logging
 from datetime import datetime
 from collections import defaultdict
-import matplotlib
-matplotlib.use('Agg') # Ensure it runs headlessly
-import matplotlib.pyplot as plt
 from flask import Flask, jsonify, send_file, render_template_string
 
 # Set werkzeug logger to ERROR to reduce spam in the console
@@ -16,7 +13,9 @@ log.setLevel(logging.ERROR)
 
 # ================= CONFIG =================
 HOST = "0.0.0.0"
-PORT = 2222
+PORT_SSH   = 2223
+PORT_TELNET = 2323
+PORT_FTP   = 2121
 
 BLOCK_THRESHOLD = 5
 MEDIUM_THRESHOLD = 3
@@ -24,8 +23,7 @@ MEDIUM_THRESHOLD = 3
 LOG_FILE = "honeypot.log"
 INCIDENT_REPORT = "incident_report.txt"
 IDS_ALERTS = "ids_alerts.txt"
-GRAPH_FILE = "attack_graph.png"
-FILE_TRAP_DIR = "file_trap"   # Feature 5
+FILE_TRAP_DIR = "file_trap"
 
 # ============== DATA ======================
 attempt_counter = defaultdict(int)
@@ -75,25 +73,112 @@ def write_incident_report():
             f.write("----------------------------\n")
 
 # ============== GRAPH (FEATURE 1) =========
-def generate_graph():
-    if not attempt_counter:
-        return
-    plt.bar(attempt_counter.keys(), attempt_counter.values())
-    plt.title("Honeypot Attack Attempts per IP")
-    plt.xlabel("IP Address")
-    plt.ylabel("Attempts")
-    plt.tight_layout()
-    plt.savefig(GRAPH_FILE)
-    plt.close()
+# Static graph generation removed in favor of live Chart.js component
 
-# ============== FAKE COMMANDS (FEATURE 2) =
-def fake_command_response(cmd):
-    fake_fs = {
-        "ls": "bin  etc  home  var\n",
-        "whoami": "root\n",
-        "pwd": "/root\n"
-    }
-    return fake_fs.get(cmd, "command not found\n")
+
+# ============== ADVANCED VIRTUAL SHELL ====
+FAKE_FS = {
+    "/": ["bin", "boot", "etc", "home", "root", "tmp", "var", "usr"],
+    "/root": [".bash_history", ".ssh", "secret.txt"],
+    "/etc": ["passwd", "shadow", "hostname", "ssh"],
+    "/etc/ssh": ["sshd_config", "ssh_host_rsa_key"],
+    "/home": ["admin", "user"],
+    "/home/admin": [".bash_history", "notes.txt"],
+    "/home/user": [".bash_history"],
+    "/tmp": [],
+    "/var": ["log", "www"],
+    "/var/log": ["syslog", "auth.log"],
+    "/var/www": ["html"],
+    "/usr": ["bin", "local", "share"],
+}
+
+FAKE_FILE_CONTENTS = {
+    "/etc/passwd": "root:x:0:0:root:/root:/bin/bash\nadmin:x:1000:1000::/home/admin:/bin/bash\n",
+    "/etc/hostname": "ubuntu-server\n",
+    "/root/secret.txt": "db_password=Sup3rS3cr3t!\napi_key=sk-1234567890abcdef\n",
+    "/home/admin/notes.txt": "TODO: change passwords\n",
+    "/etc/shadow": r"root:$6$randomsalt$hashedpassword:18000:0:99999:7:::" + "\n",
+
+}
+
+class VirtualShell:
+    def __init__(self, ip):
+        self.ip = ip
+        self.cwd = "/root"
+
+    def get_prompt(self):
+        user = "root" if self.cwd.startswith("/root") else "admin"
+        return f"{user}@ubuntu-server:{self.cwd}# ".encode()
+
+    def execute(self, raw_cmd):
+        """Execute a command and return (output_str, log_note)."""
+        parts = raw_cmd.strip().split()
+        if not parts:
+            return "", None
+        cmd = parts[0]
+        args = parts[1:]
+
+        if cmd == "pwd":
+            return self.cwd + "\n", None
+
+        elif cmd == "whoami":
+            return "root\n", None
+
+        elif cmd == "uname":
+            return "Linux ubuntu-server 5.15.0-78-generic #85-Ubuntu x86_64 GNU/Linux\n", None
+
+        elif cmd == "id":
+            return "uid=0(root) gid=0(root) groups=0(root)\n", None
+
+        elif cmd == "ls":
+            path = args[0] if args else self.cwd
+            if path and not path.startswith("/"):
+                path = self.cwd.rstrip("/") + "/" + path
+            contents = FAKE_FS.get(path)
+            if contents is None:
+                return f"ls: cannot access '{path}': No such file or directory\n", None
+            return "  ".join(contents) + "\n" if contents else "\n", None
+
+        elif cmd == "cd":
+            target = args[0] if args else "/root"
+            if target == "..":
+                parent = "/".join(self.cwd.rstrip("/").split("/")[:-1])
+                target = parent if parent else "/"
+            elif not target.startswith("/"):
+                target = self.cwd.rstrip("/") + "/" + target
+            # Normalize double slashes
+            target = target.replace("//", "/")
+            if target in FAKE_FS:
+                self.cwd = target
+                return "", None
+            else:
+                return f"bash: cd: {target}: No such file or directory\n", None
+
+        elif cmd == "cat":
+            if not args:
+                return "cat: missing operand\n", None
+            path = args[0] if args[0].startswith("/") else self.cwd.rstrip("/") + "/" + args[0]
+            content = FAKE_FILE_CONTENTS.get(path)
+            if content:
+                return content, f"READ SENSITIVE FILE {path}"
+            return f"cat: {args[0]}: No such file or directory\n", None
+
+        elif cmd in ("wget", "curl"):
+            url = args[0] if args else "<unknown>"
+            note = f"[PAYLOAD CAPTURE] {cmd.upper()} ATTEMPT | URL={url}"
+            return f"Connecting to {url}... connected.\nHTTP request sent, awaiting response... 200 OK\n", note
+
+        elif cmd == "exit":
+            return "logout\n", "SESSION_END"
+
+        elif cmd == "history":
+            return "    1  ls\n    2  cd /etc\n    3  cat passwd\n", None
+
+        elif cmd == "ifconfig" or cmd == "ip":
+            return "eth0: inet 192.168.1.100  netmask 255.255.255.0  broadcast 192.168.1.255\n", None
+
+        else:
+            return f"bash: {cmd}: command not found\n", None
 
 # ============== FILE TRAP (FEATURE 5) =====
 def setup_file_trap():
@@ -119,109 +204,273 @@ def monitor_file_trap():
                 export_ids_alert(alert)
                 baseline[f] = os.path.getmtime(path)
 
-# ============== CLIENT HANDLER ============
+# ============== SSH CLIENT HANDLER ============
 def handle_client(conn, addr):
     ip, port = addr
     attempt_counter[ip] += 1
-
     geo_map[ip] = geo_lookup(ip)
     severity = classify_severity(ip)
 
-    base_log = f"{datetime.now()} | {ip}:{port} | Attempt {attempt_counter[ip]} | Severity={severity}"
+    base_log = f"{datetime.now()} | SSH | {ip}:{port} | Attempt {attempt_counter[ip]} | Severity={severity}"
     log_attack(base_log)
-
     if severity == "HIGH":
         export_ids_alert(f"[IDS ALERT] {base_log}")
 
     try:
-        conn.sendall(b"Welcome to Secure Server v1.2\n")
-        conn.sendall(b"Username: ")
+        conn.sendall(b"\r\nWelcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-78-generic x86_64)\r\n\r\n")
+        conn.sendall(b"login: ")
         user = conn.recv(1024).decode(errors="ignore").strip()
-
         conn.sendall(b"Password: ")
         pwd = conn.recv(1024).decode(errors="ignore").strip()
 
-        log_attack(f"{datetime.now()} | LOGIN FAIL | IP={ip} USER={user} PASS={pwd}")
-        conn.sendall(b"Login failed\n")
+        log_attack(f"{datetime.now()} | SSH | LOGIN | IP={ip} USER={user} PASS={pwd}")
+        conn.sendall(b"\r\nLast login: Mon Mar  4 09:12:44 2026 from 10.0.0.1\r\n")
 
-        # Fake shell
-        conn.sendall(b"$ ")
-        cmd = conn.recv(1024).decode(errors="ignore").strip()
-        conn.sendall(fake_command_response(cmd).encode())
+        # Advanced interactive shell loop
+        shell = VirtualShell(ip)
+        conn.sendall(shell.get_prompt())
 
-        log_attack(f"{datetime.now()} | CMD | IP={ip} CMD={cmd}")
+        while True:
+            try:
+                data = conn.recv(1024)
+                if not data:
+                    break
+                cmd_str = data.decode(errors="ignore").strip()
+                out, note = shell.execute(cmd_str)
+                if note:
+                    log_attack(f"{datetime.now()} | SSH | CMD | IP={ip} CMD={cmd_str} NOTE={note}")
+                    if "PAYLOAD" in note:
+                        export_ids_alert(f"[IDS ALERT] {note} from IP={ip}")
+                else:
+                    log_attack(f"{datetime.now()} | SSH | CMD | IP={ip} CMD={cmd_str}")
+                conn.sendall(out.encode())
+                if note == "SESSION_END":
+                    break
+                conn.sendall(shell.get_prompt())
+            except Exception:
+                break
 
         if severity == "HIGH":
-            conn.sendall(b"\n[!] Too many attempts detected. Logged.\n")
-            time.sleep(3)
+            conn.sendall(b"\r\n[!] Too many attempts detected. Connection logged.\r\n")
 
     except Exception as e:
         log_attack(f"Error: {e}")
-
     finally:
         write_incident_report()
         generate_graph()
         conn.close()
 
+# ============== TELNET CLIENT HANDLER =========
+def handle_telnet_client(conn, addr):
+    ip, port = addr
+    attempt_counter[ip] += 1
+    geo_map[ip] = geo_lookup(ip)
+    severity = classify_severity(ip)
+
+    base_log = f"{datetime.now()} | TELNET | {ip}:{port} | Attempt {attempt_counter[ip]} | Severity={severity}"
+    log_attack(base_log)
+    if severity == "HIGH":
+        export_ids_alert(f"[IDS ALERT] {base_log}")
+
+    try:
+        # Telnet negotiation bytes (will suppress option negotiation from client)
+        conn.sendall(bytes([255, 251, 3, 255, 251, 1]))  # IAC WILL SGA, IAC WILL ECHO
+        conn.sendall(b"\r\nUbuntu 22.04 LTS\r\nubuntu-server login: ")
+        user = conn.recv(1024).decode(errors="ignore").strip()
+        conn.sendall(b"Password: ")
+        pwd = conn.recv(1024).decode(errors="ignore").strip()
+
+        log_attack(f"{datetime.now()} | TELNET | LOGIN | IP={ip} USER={user} PASS={pwd}")
+        conn.sendall(b"\r\nWelcome to Ubuntu 22.04.3 LTS!\r\n")
+
+        shell = VirtualShell(ip)
+        conn.sendall(shell.get_prompt())
+
+        while True:
+            try:
+                data = conn.recv(1024)
+                if not data:
+                    break
+                cmd_str = data.decode(errors="ignore").strip()
+                out, note = shell.execute(cmd_str)
+                if note:
+                    log_attack(f"{datetime.now()} | TELNET | CMD | IP={ip} CMD={cmd_str} NOTE={note}")
+                    if "PAYLOAD" in note:
+                        export_ids_alert(f"[IDS ALERT] {note} from IP={ip}")
+                else:
+                    log_attack(f"{datetime.now()} | TELNET | CMD | IP={ip} CMD={cmd_str}")
+                conn.sendall(out.encode())
+                if note == "SESSION_END":
+                    break
+                conn.sendall(shell.get_prompt())
+            except Exception:
+                break
+
+    except Exception as e:
+        log_attack(f"Telnet Error: {e}")
+    finally:
+        write_incident_report()
+        conn.close()
+
+# ============== FTP CLIENT HANDLER ============
+def handle_ftp_client(conn, addr):
+    ip, port = addr
+    attempt_counter[ip] += 1
+    geo_map[ip] = geo_lookup(ip)
+    severity = classify_severity(ip)
+
+    base_log = f"{datetime.now()} | FTP | {ip}:{port} | Attempt {attempt_counter[ip]} | Severity={severity}"
+    log_attack(base_log)
+    if severity == "HIGH":
+        export_ids_alert(f"[IDS ALERT] {base_log}")
+
+    try:
+        conn.sendall(b"220 ProFTPD 1.3.5 Server (ubuntu-ftp) ready.\r\n")
+        user = ""
+        while True:
+            try:
+                data = conn.recv(1024)
+                if not data:
+                    break
+                line = data.decode(errors="ignore").strip()
+                cmd = line.split()[0].upper() if line.split() else ""
+                arg = line[len(cmd):].strip() if cmd else ""
+
+                if cmd == "USER":
+                    user = arg
+                    conn.sendall(f"331 Password required for {user}.\r\n".encode())
+                elif cmd == "PASS":
+                    log_attack(f"{datetime.now()} | FTP | LOGIN | IP={ip} USER={user} PASS={arg}")
+                    conn.sendall(b"530 Login incorrect.\r\n")
+                    break
+                elif cmd == "QUIT":
+                    conn.sendall(b"221 Goodbye.\r\n")
+                    break
+                elif cmd == "SYST":
+                    conn.sendall(b"215 UNIX Type: L8\r\n")
+                elif cmd == "FEAT":
+                    conn.sendall(b"211-Features:\r\n UTF8\r\n211 End\r\n")
+                else:
+                    conn.sendall(b"530 Please login with USER and PASS.\r\n")
+            except Exception:
+                break
+
+    except Exception as e:
+        log_attack(f"FTP Error: {e}")
+    finally:
+        write_incident_report()
+        conn.close()
+
+# ============== PROTOCOL SERVERS ==============
+def start_server(port, handler, label):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind((HOST, port))
+        server.listen(5)
+        print(f"[+] {label} honeypot listening on {HOST}:{port}")
+        while True:
+            try:
+                conn, addr = server.accept()
+                threading.Thread(target=handler, args=(conn, addr), daemon=True).start()
+            except Exception:
+                break
+    except PermissionError:
+        print(f"[!] Permission denied for port {port}. Run as Administrator to bind ports < 1024.")
+    except Exception as e:
+        print(f"[!] Error on {label} server: {e}")
+
 # ============== DASHBOARD FRONTEND ========
 CSS_CONTENT = """
 :root {
-    --bg-dark: #0f172a; --bg-panel: #1e293b; --bg-panel-hover: #334155;
-    --text-primary: #f8fafc; --text-secondary: #94a3b8;
-    --accent-blue: #3b82f6; --accent-blue-hover: #60a5fa;
-    --accent-red: #ef4444; --accent-red-hover: #f87171;
+    --bg-dark: #080f1f; --bg-panel: #0f1c35;
+    --bg-panel-hover: #1a2d4a;
+    --text-primary: #e2e8f0; --text-secondary: #64748b;
+    --accent-blue: #38bdf8; --accent-blue-hover: #7dd3fc;
+    --accent-red: #f43f5e; --accent-red-hover: #fb7185;
     --accent-orange: #f59e0b; --accent-green: #10b981;
-    --border-color: rgba(255,255,255,0.1);
-    --glass-bg: rgba(30, 41, 59, 0.7); --glass-border: rgba(255, 255, 255, 0.1);
+    --accent-purple: #a78bfa; --accent-teal: #2dd4bf;
+    --border-color: rgba(56, 189, 248, 0.1);
+    --glass-bg: rgba(15, 28, 53, 0.75); --glass-border: rgba(56, 189, 248, 0.15);
+    --neon-blue: 0 0 8px rgba(56, 189, 248, 0.4), 0 0 20px rgba(56, 189, 248, 0.15);
+    --neon-red: 0 0 8px rgba(244, 63, 94, 0.5), 0 0 20px rgba(244, 63, 94, 0.2);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
-body { background-color: var(--bg-dark); color: var(--text-primary); display: flex; height: 100vh; overflow: hidden; }
-.sidebar { width: 250px; background-color: var(--bg-panel); border-right: 1px solid var(--border-color); display: flex; flex-direction: column; padding: 20px 0; transition: all 0.3s ease; }
-.logo { display: flex; align-items: center; gap: 15px; padding: 0 25px 30px; font-size: 1.5rem; font-weight: 700; color: var(--accent-blue); border-bottom: 1px solid var(--border-color); margin-bottom: 20px; }
+body { background: radial-gradient(ellipse at 20% 50%, #0a1628 0%, #080f1f 60%); color: var(--text-primary); display: flex; height: 100vh; overflow: hidden; }
+.sidebar { width: 240px; background: var(--glass-bg); border-right: 1px solid var(--glass-border); display: flex; flex-direction: column; padding: 20px 0; backdrop-filter: blur(16px); }
+.logo { display: flex; align-items: center; gap: 12px; padding: 0 20px 28px; font-size: 1.4rem; font-weight: 700; color: var(--accent-blue); border-bottom: 1px solid var(--glass-border); margin-bottom: 20px; text-shadow: var(--neon-blue); }
+.logo i { font-size: 1.6rem; }
 .nav-links { list-style: none; }
-.nav-links li { padding: 10px 25px; margin: 5px 15px; border-radius: 8px; transition: all 0.2s ease; }
-.nav-links li a { color: var(--text-secondary); text-decoration: none; display: flex; align-items: center; gap: 15px; font-weight: 600; transition: color 0.2s ease; }
-.nav-links li:hover { background-color: var(--bg-panel-hover); } .nav-links li:hover a { color: var(--text-primary); }
-.nav-links li.active { background-color: rgba(59, 130, 246, 0.15); border-left: 4px solid var(--accent-blue); } .nav-links li.active a { color: var(--accent-blue); }
-.dashboard { flex-grow: 1; display: flex; flex-direction: column; overflow-y: auto; padding: 30px; }
-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
-h1 { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.5px; }
-.status-indicator { display: flex; align-items: center; gap: 10px; background: var(--glass-bg); padding: 8px 16px; border-radius: 20px; border: 1px solid var(--glass-border); backdrop-filter: blur(10px); font-size: 0.9rem; font-weight: 600; color: var(--accent-green); }
-.dot { width: 10px; height: 10px; background-color: var(--accent-green); border-radius: 50%; display: inline-block; }
-.pulse { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); animation: pulse 2s infinite; }
-@keyframes pulse { 0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); } 70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); } 100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); } }
-.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 30px; }
-.stat-card { background: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 12px; padding: 20px; display: flex; align-items: center; gap: 20px; transition: transform 0.2s ease, box-shadow 0.2s ease; }
-.stat-card:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.2); }
-.stat-icon { font-size: 2rem; color: var(--accent-blue); background: rgba(59, 130, 246, 0.1); width: 60px; height: 60px; border-radius: 12px; display: flex; align-items: center; justify-content: center; }
-.stat-info h3 { font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 5px; font-weight: 600; } .stat-info p { font-size: 1.8rem; font-weight: 700; }
-.stat-card.danger .stat-icon { color: var(--accent-red); background: rgba(239, 68, 68, 0.1); } .stat-card.danger .stat-info p { color: var(--accent-red-hover); }
+.nav-links li { padding: 10px 20px; margin: 4px 12px; border-radius: 8px; transition: all 0.2s ease; }
+.nav-links li a { color: var(--text-secondary); text-decoration: none; display: flex; align-items: center; gap: 14px; font-size: 0.9rem; font-weight: 600; transition: color 0.2s ease; }
+.nav-links li:hover { background: rgba(56, 189, 248, 0.07); } .nav-links li:hover a { color: var(--text-primary); }
+.nav-links li.active { background: rgba(56, 189, 248, 0.12); border-left: 3px solid var(--accent-blue); box-shadow: inset var(--neon-blue); } .nav-links li.active a { color: var(--accent-blue); }
+.dashboard { flex-grow: 1; display: flex; flex-direction: column; overflow-y: auto; padding: 28px; }
+header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
+h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.5px; }
+.status-indicator { display: flex; align-items: center; gap: 10px; background: var(--glass-bg); padding: 8px 16px; border-radius: 20px; border: 1px solid rgba(16,185,129,0.3); backdrop-filter: blur(10px); font-size: 0.85rem; font-weight: 600; color: var(--accent-green); box-shadow: 0 0 12px rgba(16,185,129,0.1); }
+.dot { width: 9px; height: 9px; background-color: var(--accent-green); border-radius: 50%; display: inline-block; }
+.pulse { animation: pulse 2s infinite; }
+@keyframes pulse { 0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); } 70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); } 100% { transform: scale(0.95); } }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.stat-card { background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 12px; padding: 18px; display: flex; align-items: center; gap: 18px; transition: transform 0.2s ease, box-shadow 0.2s ease; backdrop-filter: blur(10px); }
+.stat-card:hover { transform: translateY(-4px); box-shadow: var(--neon-blue); }
+.stat-icon { font-size: 1.6rem; color: var(--accent-blue); background: rgba(56, 189, 248, 0.1); width: 52px; height: 52px; border-radius: 10px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(56,189,248,0.2); }
+.stat-info h3 { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; } .stat-info p { font-size: 1.7rem; font-weight: 700; }
+.stat-card.danger { border-color: rgba(244,63,94,0.2); } .stat-card.danger:hover { box-shadow: var(--neon-red); } .stat-card.danger .stat-icon { color: var(--accent-red); background: rgba(244, 63, 94, 0.1); border-color: rgba(244,63,94,0.2); } .stat-card.danger .stat-info p { color: var(--accent-red-hover); }
 .stat-card.warning .stat-icon { color: var(--accent-orange); background: rgba(245, 158, 11, 0.1); } .stat-card.warning .stat-info p { color: var(--accent-orange); }
-.main-content { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; flex-grow: 1; } .content-left { display: flex; flex-direction: column; gap: 20px; }
-.panel { background: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
-.panel-header { padding: 15px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.1); }
-.panel-header h2 { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 10px; } .panel-body { padding: 20px; flex-grow: 1; overflow-y: auto; }
-.icon-btn { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 1.1rem; transition: color 0.2s; } .icon-btn:hover { color: var(--text-primary); }
-.graph-panel { flex: 1; min-height: 350px; } .graph-panel .panel-body { display: flex; align-items: center; justify-content: center; background: #ffffff; padding: 0; }
-#attack-graph { max-width: 100%; max-height: 100%; object-fit: contain; }
-.report-panel { flex: 1; min-height: 250px; } .table-container { padding: 0 !important; }
-.data-table { width: 100%; border-collapse: collapse; text-align: left; } .data-table th, .data-table td { padding: 12px 20px; border-bottom: 1px solid var(--border-color); }
-.data-table th { background: var(--bg-panel-hover); font-weight: 600; color: var(--text-secondary); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.5px; }
-.data-table tbody tr:hover { background: rgba(255,255,255,0.02); }
-.badge { padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 700; }
-.badge-high { background: rgba(239, 68, 68, 0.2); color: var(--accent-red-hover); }
-.badge-medium { background: rgba(245, 158, 11, 0.2); color: var(--accent-orange); }
-.badge-low { background: rgba(59, 130, 246, 0.2); color: var(--accent-blue-hover); }
-.terminal-panel { height: 100%; } .terminal-body { background: #000; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; line-height: 1.5; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 5px; }
-.log-entry { margin-bottom: 4px; word-break: break-all; } .log-time { color: var(--text-secondary); margin-right: 10px; }
-.log-ip { color: var(--accent-blue-hover); font-weight: 700; } .log-alert { color: var(--accent-red-hover); font-weight: 700; }
-.log-cmd { color: var(--accent-green); } .log-misc { color: var(--text-primary); }
-.filters .filter-btn { background: none; border: 1px solid var(--border-color); color: var(--text-secondary); padding: 4px 10px; border-radius: 12px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s; }
-.filters .filter-btn.active { background: var(--border-color); color: var(--text-primary); }
-.danger-text { color: var(--accent-red) !important; border-color: rgba(239, 68, 68, 0.3) !important; } .filters .filter-btn.danger-text.active { background: rgba(239, 68, 68, 0.2) !important; }
-::-webkit-scrollbar { width: 8px; height: 8px; } ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--bg-panel-hover); border-radius: 4px; } ::-webkit-scrollbar-thumb:hover { background: #475569; }
-@media (max-width: 1024px) { .main-content { grid-template-columns: 1fr; } .content-left { height: auto; } .terminal-panel { min-height: 400px; mt: 20px; } }
+.header-actions { display: flex; align-items: center; gap: 12px; }
+.clear-all-btn { display: flex; align-items: center; gap: 7px; background: rgba(244,63,94,0.1); border: 1px solid rgba(244,63,94,0.35); color: var(--accent-red-hover); padding: 7px 16px; border-radius: 20px; font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: all 0.2s ease; }
+.clear-all-btn:hover { background: rgba(244,63,94,0.25); box-shadow: 0 0 12px rgba(244,63,94,0.3); transform: translateY(-1px); }
+.clear-all-btn i { font-size: 0.8rem; }
+.main-content { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; flex-grow: 1; min-height: 0; } .content-left { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+.panel { background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; backdrop-filter: blur(10px); }
+.panel-header { padding: 13px 18px; border-bottom: 1px solid var(--glass-border); display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.15); flex-shrink: 0; }
+.panel-header h2 { font-size: 1rem; font-weight: 600; display: flex; align-items: center; gap: 10px; color: var(--accent-blue-hover); } .panel-body { padding: 16px; flex-grow: 1; overflow-y: auto; min-height: 0; }
+.icon-btn { background: none; border: 1px solid var(--glass-border); color: var(--text-secondary); cursor: pointer; font-size: 0.9rem; padding: 4px 8px; border-radius: 6px; transition: all 0.2s; } .icon-btn:hover { color: var(--accent-blue); border-color: var(--accent-blue); }
+.graph-panel { flex: 0 0 300px; } .graph-panel .panel-body { display: flex; align-items: center; justify-content: center; background: #fff; padding: 0; }
+#attack-graph { max-width: 100%; object-fit: contain; }
+.report-panel { flex: 1; overflow: hidden; } .table-container { padding: 0 !important; overflow-y: auto; height: 100%; }
+.data-table { width: 100%; border-collapse: collapse; text-align: left; } .data-table th, .data-table td { padding: 10px 16px; border-bottom: 1px solid var(--glass-border); white-space: nowrap; }
+.data-table thead { position: sticky; top: 0; z-index: 1; } .data-table th { background: var(--bg-panel-hover); font-weight: 600; color: var(--text-secondary); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.5px; }
+.data-table tbody tr { transition: background 0.15s; } .data-table tbody tr:hover { background: rgba(56,189,248,0.04); }
+.badge { padding: 3px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.3px; }
+.badge-high { background: rgba(244, 63, 94, 0.2); color: var(--accent-red-hover); border: 1px solid rgba(244,63,94,0.3); }
+.badge-medium { background: rgba(245, 158, 11, 0.15); color: var(--accent-orange); border: 1px solid rgba(245,158,11,0.3); }
+.badge-low { background: rgba(56, 189, 248, 0.1); color: var(--accent-blue-hover); border: 1px solid rgba(56,189,248,0.2); }
+.content-right { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+.terminal-panel { flex: 1; min-height: 0; }
+.terminal-body { background: #020810; font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; line-height: 1.6; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 2px; height: 100%; border-radius: 0 0 12px 12px; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.log-entry { animation: fadeIn 0.3s ease; word-break: break-all; }
+.log-ip { color: var(--accent-blue-hover); font-weight: 700; }
+.log-alert { color: var(--accent-red-hover); font-weight: 700; text-shadow: 0 0 6px rgba(244,63,94,0.5); }
+.log-cmd { color: var(--accent-green); }
+.log-misc { color: #4ade80; }
+.log-ftp { color: var(--accent-purple); font-weight: 600; }
+.log-telnet { color: var(--accent-teal); font-weight: 600; }
+.log-ssh { color: var(--accent-blue-hover); font-weight: 600; }
+.terminal-cursor { display: inline-block; width: 7px; height: 13px; background: #4ade80; margin-left: 2px; animation: blink 1s step-end infinite; vertical-align: middle; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+.filters { display: flex; gap: 6px; align-items: center; }
+.filter-btn { background: none; border: 1px solid var(--glass-border); color: var(--text-secondary); padding: 3px 9px; border-radius: 12px; font-size: 0.75rem; cursor: pointer; transition: all 0.2s; }
+.filter-btn.active { background: rgba(56,189,248,0.15); color: var(--accent-blue); border-color: rgba(56,189,248,0.3); }
+.clear-btn { background: none; border: 1px solid rgba(100,116,139,0.3); color: var(--text-secondary); padding: 3px 9px; border-radius: 12px; font-size: 0.75rem; cursor: pointer; transition: all 0.2s; } .clear-btn:hover { color: var(--accent-red); border-color: var(--accent-red); }
+.danger-text { color: var(--accent-red) !important; border-color: rgba(244, 63, 94, 0.3) !important; } .filter-btn.danger-text.active { background: rgba(244, 63, 94, 0.15) !important; color: var(--accent-red-hover) !important; }
+.content-right { display: flex; flex-direction: column; gap: 16px; min-height: 0; overflow: hidden; }
+.terminal-panel { display: flex; flex-direction: column; overflow: hidden; }
+.terminal-wrap { position: relative; flex-grow: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.terminal-body { background: #020810; font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; line-height: 1.6; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 2px; max-height: 480px; border-radius: 0 0 12px 12px; }
+.scroll-btn { position: absolute; bottom: 12px; right: 12px; width: 30px; height: 30px; border-radius: 50%; background: rgba(56,189,248,0.2); border: 1px solid rgba(56,189,248,0.4); color: var(--accent-blue); cursor: pointer; display: none; align-items: center; justify-content: center; font-size: 0.85rem; z-index: 10; transition: all 0.2s ease; box-shadow: 0 0 8px rgba(56,189,248,0.3); }
+.scroll-btn:hover { background: rgba(56,189,248,0.35); transform: translateY(2px); }
+.scroll-btn.visible { display: flex; }
+.alerts-panel { flex: 0 0 auto; }
+.alert-ticker { padding: 10px; display: flex; flex-direction: column; gap: 6px; max-height: 160px; overflow-y: auto; }
+.alert-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; background: rgba(244,63,94,0.07); border: 1px solid rgba(244,63,94,0.2); border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--accent-red-hover); animation: fadeIn 0.4s ease; word-break: break-all; }
+.alert-item i { color: var(--accent-red); margin-top: 2px; flex-shrink: 0; }
+.no-alerts { color: var(--text-secondary); font-size: 0.8rem; text-align: center; padding: 16px; }
+::-webkit-scrollbar { width: 5px; height: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--bg-panel-hover); border-radius: 3px; }
+@media (max-width: 1024px) { .main-content { grid-template-columns: 1fr; } .terminal-panel { min-height: 300px; } }
 """
 
 JS_CONTENT = r"""
@@ -234,6 +483,42 @@ document.querySelectorAll('.filter-btn').forEach(btn => {
         currentLogFilter = e.target.dataset.filter;
         fetchLogs();
     });
+});
+function clearAll() {
+    if (!confirm('Clear all logs and reset the dashboard?')) return;
+    fetch('/api/clear-logs', { method: 'POST' })
+        .then(() => {
+            // Reset terminal
+            document.getElementById('log-terminal').innerHTML = '<span class="terminal-cursor"></span>';
+            // Reset alerts panel
+            document.getElementById('alerts-ticker').innerHTML = '<p class="no-alerts"><i class="fa-solid fa-shield-check"></i>&nbsp; No active alerts</p>';
+            // Reset stat counters
+            ['total-attacks','unique-ips','high-severity','medium-severity'].forEach(id => document.getElementById(id).innerText = '0');
+            // Reset incident report table
+            document.getElementById('report-table-body').innerHTML = '';
+            // Reset graph instance
+            if (attackChart) {
+                attackChart.destroy();
+                attackChart = null;
+            }
+        })
+        .catch(err => console.error('Clear failed:', err));
+}
+// Keep clearTerminal as alias for the in-console eraser button
+function clearTerminal() { clearAll(); }
+function scrollTerminalToBottom() {
+    const t = document.getElementById('log-terminal');
+    t.scrollTop = t.scrollHeight;
+}
+document.addEventListener('DOMContentLoaded', () => {
+    const terminal = document.getElementById('log-terminal');
+    const scrollBtn = document.getElementById('scroll-btn');
+    if (terminal && scrollBtn) {
+        terminal.addEventListener('scroll', () => {
+            const atBottom = terminal.scrollHeight - terminal.clientHeight <= terminal.scrollTop + 20;
+            scrollBtn.classList.toggle('visible', !atBottom);
+        });
+    }
 });
 async function refreshData() { await Promise.all([ fetchStats(), fetchReport(), fetchLogs(), fetchGraph() ]); }
 async function fetchStats() {
@@ -255,7 +540,7 @@ async function fetchReport() {
             let badgeClass = 'badge-low';
             if (item.Severity === 'HIGH') badgeClass = 'badge-high';
             else if (item.Severity === 'MEDIUM') badgeClass = 'badge-medium';
-            tr.innerHTML = `<td><strong>${item['IP Address']}</strong></td><td>${item.Country}</td><td>${item.Attempts}</td><td><span class="badge ${badgeClass}">${item.Severity}</span></td>`;
+            tr.innerHTML = `<td><strong>${item['IP Address'] || ''}</strong></td><td>${item.Country || ''}</td><td>${item.Attempts || ''}</td><td><span class="badge ${badgeClass}">${item.Severity || ''}</span></td>`;
             tbody.appendChild(tr);
         });
     } catch (error) { console.error("Error fetching report:", error); }
@@ -264,25 +549,98 @@ async function fetchLogs() {
     try {
         const response = await fetch('/api/logs'); const data = await response.json();
         const terminal = document.getElementById('log-terminal');
-        const isScrolledToBottom = terminal.scrollHeight - terminal.clientHeight <= terminal.scrollTop + 1;
+        const isScrolledToBottom = terminal.scrollHeight - terminal.clientHeight <= terminal.scrollTop + 5;
         terminal.innerHTML = '';
         let logsToRender = (currentLogFilter === 'all') ? data.honeypot_logs : data.ids_alerts;
         logsToRender.forEach(log => {
             const div = document.createElement('div'); div.className = 'log-entry'; div.innerHTML = formatLog(log); terminal.appendChild(div);
         });
+        const cursor = document.createElement('span'); cursor.className = 'terminal-cursor'; terminal.appendChild(cursor);
         if (isScrolledToBottom) { terminal.scrollTop = terminal.scrollHeight; }
+        // Also update the alerts panel
+        updateAlertsPanel(data.ids_alerts);
     } catch (error) { console.error("Error fetching logs:", error); }
 }
+function updateAlertsPanel(alerts) {
+    const panel = document.getElementById('alerts-ticker');
+    if (!panel) return;
+    panel.innerHTML = '';
+    if (!alerts || alerts.length === 0) { panel.innerHTML = '<p class="no-alerts"><i class="fa-solid fa-shield-check"></i>&nbsp; No active alerts</p>'; return; }
+    alerts.slice(-5).reverse().forEach(alert => {
+        const div = document.createElement('div'); div.className = 'alert-item';
+        div.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><span>${alert}</span>`;
+        panel.appendChild(div);
+    });
+}
+function getProtocolClass(logLine) {
+    if (logLine.includes('| FTP |')) return 'log-ftp';
+    if (logLine.includes('| TELNET |')) return 'log-telnet';
+    if (logLine.includes('| SSH |')) return 'log-ssh';
+    return '';
+}
 function formatLog(logLine) {
-    let isAlert = logLine.includes('[IDS ALERT]') || logLine.includes('ALERT');
+    let isAlert = logLine.includes('[IDS ALERT]') || logLine.includes('[ALERT]')|| logLine.includes('[PAYLOAD');
     let colorized = logLine.replace(/([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?)/g, '<span class="log-ip">$1</span>');
     if (isAlert) { return `<span class="log-alert">${colorized}</span>`; }
-    else if (logLine.includes('CMD=')) {
-        colorized = colorized.replace(/(CMD=.*)/, '<span class="log-cmd">$1</span>');
-        return `<span class="log-misc">${colorized}</span>`;
-    } else { return `<span class="log-misc">${colorized}</span>`; }
+    const protoClass = getProtocolClass(logLine);
+    if (logLine.includes('CMD=')) {
+        colorized = colorized.replace(/(CMD=\S+)/, '<span class="log-cmd">$1</span>');
+    }
+    if (logLine.includes('| SSH |')) colorized = colorized.replace('| SSH |', `| <span class="log-ssh">SSH</span> |`);
+    else if (logLine.includes('| TELNET |')) colorized = colorized.replace('| TELNET |', `| <span class="log-telnet">TELNET</span> |`);
+    else if (logLine.includes('| FTP |')) colorized = colorized.replace('| FTP |', `| <span class="log-ftp">FTP</span> |`);
+    return `<span class="log-misc">${colorized}</span>`;
 }
-async function fetchGraph() { const img = document.getElementById('attack-graph'); img.src = '/api/graph?' + new Date().getTime(); }
+let attackChart = null;
+async function fetchGraph() {
+    try {
+        const response = await fetch('/api/chart-data');
+        const data = await response.json();
+        const ctx = document.getElementById('attackChart');
+        if (!ctx) return;
+        
+        if (attackChart) {
+            attackChart.data.labels = data.labels;
+            attackChart.data.datasets[0].data = data.values;
+            attackChart.update();
+        } else {
+            attackChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        label: 'Attack Attempts',
+                        data: data.values,
+                        backgroundColor: 'rgba(56, 189, 248, 0.8)',
+                        borderColor: 'rgb(56, 189, 248)',
+                        borderWidth: 1,
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: { duration: 500, easing: 'easeOutQuart' },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { backgroundColor: 'rgba(2, 8, 16, 0.9)', titleColor: '#38bdf8' }
+                    },
+                    scales: {
+                        y: { 
+                            beginAtZero: true, 
+                            grid: { color: 'rgba(100, 116, 139, 0.1)', borderDash: [5, 5] },
+                            ticks: { color: 'rgba(148, 163, 184, 0.8)', stepSize: 1 }
+                        },
+                        x: { 
+                            grid: { display: false },
+                            ticks: { color: 'rgba(148, 163, 184, 0.8)' }
+                        }
+                    }
+                }
+            });
+        }
+    } catch (error) { console.error("Error fetching chart data:", error); }
+}
 function animateValue(id, start, end, duration) {
     if (isNaN(start)) start = 0;
     if (start === end) { document.getElementById(id).innerText = end; return; }
@@ -304,9 +662,11 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Honeypot Dashboard</title>
+    <title>AuraSec &mdash; Honeypot SOC Dashboard</title>
+    <meta name="description" content="Real-time Security Operations Center dashboard for Honeypot attack monitoring.">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>{{ css_content|safe }}</style>
 </head>
 <body class="dark-theme">
@@ -314,15 +674,20 @@ HTML_CONTENT = """
         <div class="logo"><i class="fa-solid fa-shield-halved"></i><span>AuraSec</span></div>
         <ul class="nav-links">
             <li class="active"><a href="#"><i class="fa-solid fa-chart-line"></i> Dashboard</a></li>
-            <li><a href="#"><i class="fa-solid fa-list-check"></i> Incident Reports</a></li>
-            <li><a href="#"><i class="fa-solid fa-terminal"></i> Live Logs</a></li>
+            <li><a href="#"><i class="fa-solid fa-list-check"></i> Incidents</a></li>
+            <li><a href="#"><i class="fa-solid fa-terminal"></i> Console</a></li>
             <li><a href="#"><i class="fa-solid fa-gear"></i> Settings</a></li>
         </ul>
     </nav>
     <main class="dashboard">
         <header>
-            <h1>Security Operations Center (SOC)</h1>
-            <div class="status-indicator"><span class="dot pulse"></span><span>Honeypot Active</span></div>
+            <h1><i class="fa-solid fa-radar" style="font-size:1.2rem;color:var(--accent-blue);margin-right:10px;"></i>Security Operations Center</h1>
+            <div class="header-actions">
+                <button class="clear-all-btn" onclick="clearAll()" title="Clear all logs and reset dashboard">
+                    <i class="fa-solid fa-trash-can"></i> Clear All
+                </button>
+                <div class="status-indicator"><span class="dot pulse"></span><span>Honeypot Active</span></div>
+            </div>
         </header>
         <section class="stats-grid">
             <div class="stat-card">
@@ -345,8 +710,13 @@ HTML_CONTENT = """
         <section class="main-content">
             <div class="content-left">
                 <div class="panel graph-panel">
-                    <div class="panel-header"><h2><i class="fa-solid fa-chart-bar"></i> Attack Distribution</h2><button class="icon-btn" onclick="refreshData()"><i class="fa-solid fa-rotate-right"></i></button></div>
-                    <div class="panel-body"><img id="attack-graph" src="/api/graph" alt="Attack Graph"></div>
+                    <div class="panel-header">
+                        <h2><i class="fa-solid fa-chart-bar"></i> Attack Distribution</h2>
+                        <button class="icon-btn" onclick="refreshData()" title="Refresh"><i class="fa-solid fa-rotate-right"></i> Refresh</button>
+                    </div>
+                    <div class="panel-body" style="position: relative; height: 300px; padding: 10px;">
+                        <canvas id="attackChart"></canvas>
+                    </div>
                 </div>
                 <div class="panel report-panel">
                     <div class="panel-header"><h2><i class="fa-solid fa-file-contract"></i> Incident Report</h2></div>
@@ -359,9 +729,23 @@ HTML_CONTENT = """
                 </div>
             </div>
             <div class="content-right">
+                <div class="panel alerts-panel">
+                    <div class="panel-header"><h2><i class="fa-solid fa-bell" style="color:var(--accent-red);"></i>&nbsp;High Alerts</h2></div>
+                    <div class="alert-ticker" id="alerts-ticker"><p class="no-alerts"><i class="fa-solid fa-shield-check"></i>&nbsp; No active alerts</p></div>
+                </div>
                 <div class="panel terminal-panel">
-                    <div class="panel-header"><h2><i class="fa-solid fa-terminal"></i> Live Terminal</h2><div class="filters"><button class="filter-btn active" data-filter="all">All</button><button class="filter-btn danger-text" data-filter="alert">Alerts</button></div></div>
-                    <div class="panel-body terminal-body" id="log-terminal"></div>
+                    <div class="panel-header">
+                        <h2><i class="fa-solid fa-terminal"></i> Live Console</h2>
+                        <div class="filters">
+                            <button class="filter-btn active" data-filter="all">All</button>
+                            <button class="filter-btn danger-text" data-filter="alert">Alerts</button>
+                            <button class="clear-btn" onclick="clearTerminal()" title="Clear view"><i class="fa-solid fa-eraser"></i></button>
+                        </div>
+                    </div>
+                    <div class="terminal-wrap">
+                        <div class="panel-body terminal-body" id="log-terminal"><span class="terminal-cursor"></span></div>
+                        <button class="scroll-btn" id="scroll-btn" onclick="scrollTerminalToBottom()" title="Scroll to bottom"><i class="fa-solid fa-angles-down"></i></button>
+                    </div>
                 </div>
             </div>
         </section>
@@ -426,6 +810,16 @@ def get_logs():
         "ids_alerts": read_tail(IDS_ALERTS, 50)
     })
 
+@app.route('/api/clear-logs', methods=['POST'])
+def clear_logs():
+    """Wipe all log files and reset the incident report."""
+    for f in [LOG_FILE, IDS_ALERTS, INCIDENT_REPORT]:
+        try:
+            open(f, 'w').close()
+        except Exception:
+            pass
+    return jsonify({"status": "cleared"})
+
 @app.route('/api/report')
 def get_report():
     report_data = []
@@ -446,41 +840,38 @@ def get_report():
                         
     return jsonify(report_data)
 
-@app.route('/api/graph')
-def get_graph():
-    if os.path.exists(GRAPH_FILE):
-        return send_file(GRAPH_FILE, mimetype='image/png')
-    else:
-        return "Graph not found", 404
+@app.route('/api/chart-data')
+def get_chart_data():
+    """Returns JSON array of attack attempt frequencies for Chart.js"""
+    labels = list(attempt_counter.keys())
+    values = list(attempt_counter.values())
+    return jsonify({
+        "labels": labels,
+        "values": values
+    })
 
 def start_flask():
-    app.run(debug=False, port=5000, host="0.0.0.0", use_reloader=False)
+    app.run(debug=False, port=5001, host="0.0.0.0", use_reloader=False)
 
 # ============== MAIN SERVER ====================
 def start_honeypot():
     setup_file_trap()
     threading.Thread(target=monitor_file_trap, daemon=True).start()
-    
-    # Start the Dashboard concurrently
+
+    # Start the web dashboard concurrently
     threading.Thread(target=start_flask, daemon=True).start()
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Allows address reuse so we don't get "Address already in use" quickly testing it
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(5)
+    # Start Telnet and FTP honeypots in background threads
+    threading.Thread(target=start_server, args=(PORT_TELNET, handle_telnet_client, "Telnet"), daemon=True).start()
+    threading.Thread(target=start_server, args=(PORT_FTP, handle_ftp_client, "FTP"), daemon=True).start()
 
-    print(f"[+] Honeypot running on {HOST}:{PORT}")
-    print(f"[+] Dashboard running on http://127.0.0.1:5000")
-
-    while True:
-        try:
-            conn, addr = server.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
-        except KeyboardInterrupt:
-            print("\n[!] Shutting down...")
-            break
+    # SSH honeypot runs in main thread
+    print(f"[+] Dashboard running on http://127.0.0.1:5001")
+    start_server(PORT_SSH, handle_client, "SSH")
 
 # ============== MAIN ENTRY ====================
 if __name__ == "__main__":
-    start_honeypot()
+    try:
+        start_honeypot()
+    except KeyboardInterrupt:
+        print("\n[!] Shutting down all honeypot services...")
