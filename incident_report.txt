@@ -1,8 +1,0 @@
-HONEYPOT INCIDENT REPORT
-=========================
-
-IP Address   : 127.0.0.1
-Attempts     : 5
-Attack Type  : Brute Force Attack
-Severity     : HIGH
-------------------------------
