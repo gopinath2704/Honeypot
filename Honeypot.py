@@ -712,7 +712,10 @@ HTML_CONTENT = """
                 <div class="panel graph-panel">
                     <div class="panel-header">
                         <h2><i class="fa-solid fa-chart-bar"></i> Attack Distribution</h2>
-                        <button class="icon-btn" onclick="refreshData()" title="Refresh"><i class="fa-solid fa-rotate-right"></i> Refresh</button>
+                        <div class="filters">
+                            <button class="icon-btn" onclick="refreshData()" title="Refresh"><i class="fa-solid fa-rotate-right"></i> Refresh</button>
+                            <button class="clear-btn" onclick="clearAll()" title="Clear Graph"><i class="fa-solid fa-eraser"></i></button>
+                        </div>
                     </div>
                     <div class="panel-body" style="position: relative; height: 300px; padding: 10px;">
                         <canvas id="attackChart"></canvas>
